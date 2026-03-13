@@ -169,8 +169,10 @@ class NsccsLsfScheduler(LsfScheduler):
         if not lines:
             return None
             
-        # Join all lines into a single text block
-        text = ' '.join(line.strip() for line in lines)
+        # Reconstruct the original text by joining with newlines and removing
+        # the LSF line-wrap artifact (a newline followed by many spaces).
+        raw_text = '\n'.join(lines)
+        text = re.sub(r'\n\s{10,}', '', raw_text)
         
         # Extract job ID from first line: "Job <8977273>, ..."
         job_id_match = re.search(r'Job <(\d+)>', text)
