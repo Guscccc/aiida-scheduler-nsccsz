@@ -38,6 +38,12 @@ _MAP_STATUS_LSF = {
     'ZOMBI': JobState.UNDETERMINED,
 }
 
+_NO_JOB_PATTERNS = (
+    re.compile(r'No unfinished job found'),
+    re.compile(r'No job found'),
+    re.compile(r'Job <[^>]+> is not found'),
+)
+
 
 class NsccsLsfScheduler(LsfScheduler):
     """LSF scheduler plugin for NSCCSZ HPC cluster (Platform LSF 8.0.1).
@@ -56,6 +62,25 @@ class NsccsLsfScheduler(LsfScheduler):
     _features = {
         'can_query_by_user': False,
     }
+
+    @staticmethod
+    def _is_missing_job_message(line):
+        """Return whether a line is a benign missing-job diagnostic."""
+        return any(pattern.search(line) for pattern in _NO_JOB_PATTERNS)
+
+    @classmethod
+    def _has_job_entries(cls, output):
+        """Return whether ``bjobs -l`` output contains at least one job entry."""
+        return any(
+            line.strip().startswith('Job <') and not cls._is_missing_job_message(line)
+            for line in output.splitlines()
+        )
+
+    @classmethod
+    def _has_only_missing_job_messages(cls, output):
+        """Return whether output consists only of benign missing-job diagnostics."""
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        return bool(lines) and all(cls._is_missing_job_message(line) for line in lines)
 
     def _get_joblist_command(self, jobs=None, user=None):
         """Return the bjobs command to list jobs.
@@ -100,24 +125,36 @@ class NsccsLsfScheduler(LsfScheduler):
           - Multi-line job entries separated by blank lines or dashes
           - Full timestamps with year
         """
-        # 'No unfinished job found' / 'No job found' is normal — not an error
-        no_job_msgs = ('No unfinished job found', 'No job found')
+        # Missing jobs are normal when polling a batch of jobs: LSF may return
+        # retval=255 even while stdout still contains valid entries for the
+        # other requested job ids.
         if retval != 0:
-            if any(msg in stderr for msg in no_job_msgs):
+            stdout_has_jobs = self._has_job_entries(stdout)
+            stderr_is_only_missing_jobs = self._has_only_missing_job_messages(stderr)
+            stdout_is_only_missing_jobs = self._has_only_missing_job_messages(stdout)
+
+            if stdout_is_only_missing_jobs and not stderr.strip():
                 return []
-            if any(msg in stdout for msg in no_job_msgs):
+
+            if stdout_has_jobs and (not stderr.strip() or stderr_is_only_missing_jobs):
+                self.logger.debug(
+                    'Ignoring missing-job diagnostics from bjobs while parsing '
+                    f'available job entries: stdout={stdout.strip()}; stderr={stderr.strip()}'
+                )
+            elif stderr_is_only_missing_jobs:
                 return []
-            self.logger.warning(
-                f'Error in _parse_joblist_output: retval={retval}; '
-                f'stdout={stdout}; stderr={stderr}'
-            )
-            raise SchedulerError(
-                f'Error during parsing joblist output, retval={retval}\n'
-                f'stdout={stdout}\nstderr={stderr}'
-            )
+            else:
+                self.logger.warning(
+                    f'Error in _parse_joblist_output: retval={retval}; '
+                    f'stdout={stdout}; stderr={stderr}'
+                )
+                raise SchedulerError(
+                    f'Error during parsing joblist output, retval={retval}\n'
+                    f'stdout={stdout}\nstderr={stderr}'
+                )
 
         # Also handle retval=0 with 'No unfinished job found' in stdout
-        if any(msg in stdout for msg in no_job_msgs):
+        if self._has_only_missing_job_messages(stdout):
             return []
 
         lines = stdout.splitlines()
@@ -129,6 +166,9 @@ class NsccsLsfScheduler(LsfScheduler):
         current_job_lines = []
         
         for line in lines:
+            if self._is_missing_job_message(line):
+                continue
+
             # Job entries start with "Job <ID>"
             if line.strip().startswith('Job <'):
                 # Process previous job if exists
@@ -210,8 +250,9 @@ class NsccsLsfScheduler(LsfScheduler):
         if job_name_match:
             this_job.title = job_name_match.group(1)
         
-        # Extract number of processors: "36 Processors Requested"
-        procs_match = re.search(r'(\d+)\s+Processors?\s+Requested', text)
+        # Extract number of processors: "36 Processors Requested". LSF may
+        # wrap this as "36\n    Processors", which is unwrapped above.
+        procs_match = re.search(r'(\d+)\s*Processors?\s+Requested', text)
         if procs_match:
             this_job.num_mpiprocs = int(procs_match.group(1))
         
