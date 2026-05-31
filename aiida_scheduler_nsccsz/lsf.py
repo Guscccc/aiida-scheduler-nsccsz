@@ -20,8 +20,8 @@ from datetime import datetime
 import aiida.schedulers
 from aiida.common.escaping import escape_for_bash
 from aiida.schedulers import SchedulerError, SchedulerParsingError
-from aiida.schedulers.datastructures import JobInfo, JobState
-from aiida.schedulers.plugins.lsf import LsfJobResource, LsfScheduler
+from aiida.schedulers.datastructures import JobInfo, JobState, NodeNumberJobResource
+from aiida.schedulers.plugins.lsf import LsfScheduler
 
 # LSF status code mapping (same across LSF versions)
 _MAP_STATUS_LSF = {
@@ -45,6 +45,27 @@ _NO_JOB_PATTERNS = (
 )
 
 
+class NsccsLsfJobResource(NodeNumberJobResource):
+    """LSF resource class that preserves NSCCSZ ranks-per-node placement."""
+
+    @classmethod
+    def validate_resources(cls, **kwargs):
+        parallel_env = kwargs.pop('parallel_env', '')
+        if not isinstance(parallel_env, str):
+            raise TypeError('`parallel_env` must be a string')
+
+        kwargs.pop('use_num_machines', False)
+        default_mpiprocs_per_machine = kwargs.pop('default_mpiprocs_per_machine', None)
+        if 'num_mpiprocs_per_machine' not in kwargs and 'num_machines' not in kwargs:
+            kwargs['num_mpiprocs_per_machine'] = (
+                36 if default_mpiprocs_per_machine is None else default_mpiprocs_per_machine
+            )
+
+        resources = super().validate_resources(**kwargs)
+        resources.parallel_env = parallel_env
+        return resources
+
+
 class NsccsLsfScheduler(LsfScheduler):
     """LSF scheduler plugin for NSCCSZ HPC cluster (Platform LSF 8.0.1).
 
@@ -55,8 +76,7 @@ class NsccsLsfScheduler(LsfScheduler):
 
     _logger = aiida.schedulers.Scheduler._logger.getChild('nsccsz_lsf')
 
-    # Reuse the same job resource class from the built-in LSF plugin
-    _job_resource_class = LsfJobResource
+    _job_resource_class = NsccsLsfJobResource
 
     # Query only by list of jobs and not by user
     _features = {
@@ -336,7 +356,10 @@ class NsccsLsfScheduler(LsfScheduler):
         Submission options are encoded as internal metadata comments and then
         converted into command-line arguments in :meth:`submit_job`.
         """
-        lines = []
+        lines = [
+            '# The #AIIDA_LSF_ARG lines below are plugin metadata, not LSF directives.',
+            '# Add them as bsub command-line options; simply bsub-ing this script will not apply them.',
+        ]
 
         if job_tmpl.submit_as_hold:
             lines.append('#AIIDA_LSF_ARG -H')
@@ -392,10 +415,15 @@ class NsccsLsfScheduler(LsfScheduler):
                 'Job resources (tot_num_mpiprocs) are required for the LSF scheduler plugin'
             )
 
-        lines.append(f'#AIIDA_LSF_ARG -n {job_tmpl.job_resource.get_tot_num_mpiprocs()}')
+        tot_procs = job_tmpl.job_resource.get_tot_num_mpiprocs()
+        np_per_node = int(job_tmpl.job_resource.num_mpiprocs_per_machine)
 
-        if job_tmpl.job_resource.parallel_env:
-            lines.append(f'#AIIDA_LSF_ARG -m "{job_tmpl.job_resource.parallel_env}"')
+        lines.append(f'#AIIDA_LSF_ARG -n {tot_procs}')
+        lines.append(f'#AIIDA_LSF_ARG -R "span[ptile={np_per_node}]"')
+
+        parallel_env = getattr(job_tmpl.job_resource, 'parallel_env', '')
+        if parallel_env:
+            lines.append(f'#AIIDA_LSF_ARG -m "{parallel_env}"')
 
         if job_tmpl.max_wallclock_seconds is not None:
             try:
@@ -430,12 +458,7 @@ class NsccsLsfScheduler(LsfScheduler):
         app_name = job_tmpl.queue_name if job_tmpl.queue_name else 'Gsx_normal'
         lines.append(f'APP_NAME={app_name}')
 
-        tot_procs = job_tmpl.job_resource.get_tot_num_mpiprocs()
         lines.append(f'NP={tot_procs}')
-
-        np_per_node = getattr(job_tmpl.job_resource, 'num_mpiprocs_per_machine', 36)
-        if not np_per_node:
-            np_per_node = 36
         lines.append(f'NP_PER_NODE={np_per_node}')
 
         lines.append('RUN="RAW"')
