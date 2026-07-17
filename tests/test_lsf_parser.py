@@ -75,10 +75,10 @@ def test_parse_joblist_raises_for_real_nonzero_scheduler_error():
         )
 
 
-def _job_template(resources):
+def _job_template(resources, *, max_wallclock_seconds=None, custom_scheduler_commands=None):
     return SimpleNamespace(
         account=None,
-        custom_scheduler_commands=None,
+        custom_scheduler_commands=custom_scheduler_commands,
         email=None,
         email_on_started=False,
         email_on_terminated=True,
@@ -86,7 +86,7 @@ def _job_template(resources):
         job_name='aiida-11908',
         job_resource=NsccsLsfJobResource(**resources),
         max_memory_kb=None,
-        max_wallclock_seconds=None,
+        max_wallclock_seconds=max_wallclock_seconds,
         priority=None,
         queue_name='Gsx_normal',
         rerunnable=False,
@@ -124,6 +124,63 @@ def test_submit_header_defaults_to_full_node_ptile_for_legacy_tot_only_resources
     assert '#AIIDA_LSF_ARG -n 36' in header
     assert '#AIIDA_LSF_ARG -R "span[ptile=36]"' in header
     assert 'NP_PER_NODE=36' in header
+
+
+@pytest.mark.parametrize(
+    'seconds,expected',
+    [
+        (1, '00:01'),
+        (59, '00:01'),
+        (60, '00:01'),
+        (61, '00:02'),
+        (3599, '01:00'),
+        (3600, '01:00'),
+        (3601, '01:01'),
+        (43200, '12:00'),
+        (86399, '24:00'),
+        (86400, '24:00'),
+    ],
+)
+def test_submit_header_converts_wallclock_to_bsub_runlimit(seconds, expected):
+    """Wallclock seconds become one canonical ``bsub -W`` option."""
+    scheduler = NsccsLsfScheduler()
+    header = scheduler._get_submit_script_header(
+        _job_template(
+            {'tot_num_mpiprocs': 36},
+            max_wallclock_seconds=seconds,
+        )
+    )
+
+    assert header.count(f'#AIIDA_LSF_ARG -W {expected}') == 1
+    command = scheduler._build_submit_command_from_script('_aiidasubmit.sh', header)
+    assert command.count(f'-W {expected}') == 1
+
+
+@pytest.mark.parametrize('seconds', [0, -1])
+def test_submit_header_rejects_invalid_explicit_wallclock(seconds):
+    """Explicit non-positive wallclock values are invalid."""
+    scheduler = NsccsLsfScheduler()
+    with pytest.raises(ValueError, match='positive integer'):
+        scheduler._get_submit_script_header(
+            _job_template(
+                {'tot_num_mpiprocs': 36},
+                max_wallclock_seconds=seconds,
+            )
+        )
+
+
+def test_parse_joblist_extracts_requested_wallclock():
+    """Parse the RUNLIMIT representation returned by ``bjobs -l``."""
+    scheduler = NsccsLsfScheduler()
+    output = BJOBS_L_OUTPUT.replace(
+        ' PENDING REASONS:',
+        ' RUNLIMIT 720.0 min;\n PENDING REASONS:',
+    )
+
+    jobs = scheduler._parse_joblist_output(0, output, '')
+
+    assert len(jobs) == 1
+    assert jobs[0].requested_wallclock_time_seconds == 43200
 
 
 def test_job_resource_accepts_legacy_lsf_resource_keys():

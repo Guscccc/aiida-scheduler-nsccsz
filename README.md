@@ -16,6 +16,18 @@ AiiDA's built-in `core.lsf` scheduler plugin uses `bjobs -noheader -o '...'` whi
 | Script header | Includes `$LSB_OUTDIR` copy | No copy (jobs run in place) |
 | Node count | `#BSUB -nnodes` (LSF 9.1+) | Always uses `#BSUB -n` |
 
+## Wall-clock limits
+
+AiiDA `metadata.options.max_wallclock_seconds` is converted to the cluster's
+native `bsub -W [hour:]minute` command-line option. Positive partial minutes
+are rounded up because LSF has minute resolution. NSCCSZ currently has
+`ABS_RUNLIMIT=Y`, so this is an absolute wall-clock limit. At the limit LSF
+sends `SIGUSR2` and may kill a job that has not exited within the configured
+grace period.
+
+The scheduler option does not add application-specific command-line flags;
+calculation plugins remain responsible for any separate graceful-stop option.
+
 ## Installation
 
 ```bash

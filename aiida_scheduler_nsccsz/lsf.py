@@ -45,6 +45,26 @@ _NO_JOB_PATTERNS = (
 )
 
 
+def _seconds_to_lsf_runlimit(seconds):
+    """Convert seconds to canonical LSF ``-W [hour:]minute`` syntax.
+
+    LSF accepts minute resolution only, so a positive partial minute is rounded
+    up to avoid requesting less wall time than AiiDA specified.
+    """
+    try:
+        total_seconds = int(seconds)
+        if total_seconds <= 0:
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"max_wallclock_seconds must be a positive integer, got: '{seconds}'"
+        ) from exc
+
+    total_minutes = -(-total_seconds // 60)
+    hours, minutes = divmod(total_minutes, 60)
+    return f'{hours:02d}:{minutes:02d}'
+
+
 class NsccsLsfJobResource(NodeNumberJobResource):
     """LSF resource class that preserves NSCCSZ ranks-per-node placement."""
 
@@ -426,18 +446,8 @@ class NsccsLsfScheduler(LsfScheduler):
             lines.append(f'#AIIDA_LSF_ARG -m "{parallel_env}"')
 
         if job_tmpl.max_wallclock_seconds is not None:
-            try:
-                tot_secs = int(job_tmpl.max_wallclock_seconds)
-                if tot_secs <= 0:
-                    raise ValueError
-            except ValueError as exc:
-                raise ValueError(
-                    f"max_wallclock_seconds must be a positive integer, got: "
-                    f"'{job_tmpl.max_wallclock_seconds}'"
-                ) from exc
-            hours = tot_secs // 3600
-            minutes = -(-(tot_secs % 3600) // 60)
-            lines.append(f'#AIIDA_LSF_ARG -W {hours:02d}:{minutes:02d}')
+            runlimit = _seconds_to_lsf_runlimit(job_tmpl.max_wallclock_seconds)
+            lines.append(f'#AIIDA_LSF_ARG -W {runlimit}')
 
         if job_tmpl.max_memory_kb:
             try:
